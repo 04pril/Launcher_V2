@@ -117,6 +117,29 @@ app.Map("/ws", async context =>
                     break;
                 }
 
+                case "config":
+                {
+                    if (!RequireRoom(peer, room, out var current))
+                        break;
+
+                    var config = RaceConfig.TryParse(message);
+                    if (config is null)
+                    {
+                        await peer.SendErrorAsync("bad-config", "Room configuration is invalid.", json, context.RequestAborted);
+                        break;
+                    }
+
+                    var result = current!.TryConfigure(peer, config.Value);
+                    if (!result.Ok)
+                    {
+                        await peer.SendErrorAsync(result.Code, result.Message, json, context.RequestAborted);
+                        break;
+                    }
+
+                    await current.BroadcastRoomAsync(json, context.RequestAborted);
+                    break;
+                }
+
                 case "start":
                 {
                     if (!RequireRoom(peer, room, out var current))
@@ -311,6 +334,7 @@ sealed class RaceRoom
     public string Id { get; }
     public int Epoch { get; private set; }
     public long? StartAt { get; private set; }
+    public RaceConfig? Config { get; private set; }
 
     public int Count
     {
@@ -359,6 +383,7 @@ sealed class RaceRoom
             {
                 StartAt = null;
                 Epoch = 0;
+                Config = null;
             }
         }
     }
@@ -372,6 +397,19 @@ sealed class RaceRoom
         }
     }
 
+    public StartResult TryConfigure(WebPeer peer, RaceConfig config)
+    {
+        lock (_gate)
+        {
+            var host = Array.FindIndex(_slots, x => x is not null);
+            if (host < 0 || peer.Slot != host)
+                return StartResult.Fail("not-host", "Only the room host can change room settings.");
+
+            Config = config;
+            return StartResult.Success(0);
+        }
+    }
+
     public StartResult TryStart(WebPeer peer)
     {
         lock (_gate)
@@ -381,8 +419,8 @@ sealed class RaceRoom
                 return StartResult.Fail("not-host", "Only the room host can start.");
 
             var players = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
-            if (players.Length < 1)
-                return StartResult.Fail("empty-room", "Room has no players.");
+            if (players.Length < 2)
+                return StartResult.Fail("not-enough-players", "Multiplayer requires at least two players.");
 
             if (players.Any(x => x.Slot != host && !x.Ready))
                 return StartResult.Fail("not-ready", "All non-host players must be ready.");
@@ -426,6 +464,7 @@ sealed class RaceRoom
                 maxPlayers = MaxPlayers,
                 epoch = Epoch,
                 startAt = StartAt,
+                config = Config,
                 players = _slots.Select((peer, slot) => peer is null ? null : new
                 {
                     slot,
@@ -468,6 +507,39 @@ sealed class RaceRoom
     }
 
     public static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+}
+
+readonly record struct RaceConfig(
+    string TrackId,
+    string MapPath,
+    int Speed,
+    int Booster)
+{
+    public static RaceConfig? TryParse(JsonObject message)
+    {
+        try
+        {
+            var trackId = message["trackId"]?.GetValue<string>()?.Trim() ?? "";
+            var mapPath = message["mapPath"]?.GetValue<string>()?.Trim() ?? "";
+            var speed = message["speed"]?.GetValue<int?>() ?? 7;
+            var booster = message["booster"]?.GetValue<int?>() ?? 0;
+
+            if (trackId.Length is < 1 or > 64 ||
+                mapPath.Length is < 1 or > 192 ||
+                !mapPath.StartsWith("track_/", StringComparison.OrdinalIgnoreCase) ||
+                mapPath.Any(char.IsControl) ||
+                trackId.Any(char.IsControl) ||
+                speed is < 0 or > 16 ||
+                booster is < 0 or > 16)
+                return null;
+
+            return new RaceConfig(trackId, mapPath, speed, booster);
+        }
+        catch
+        {
+            return null;
+        }
+    }
 }
 
 readonly record struct RaceState(
