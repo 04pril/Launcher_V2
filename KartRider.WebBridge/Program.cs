@@ -153,12 +153,57 @@ app.Map("/ws", async context =>
 
                     await current.BroadcastAsync(new
                     {
-                        type = "start",
+                        type = "prepare",
                         room = current.Id,
                         epoch = current.Epoch,
-                        startAt = result.StartAt,
                         serverTime = RaceRoom.NowMs()
                     }, json, context.RequestAborted);
+                    await current.BroadcastRoomAsync(json, context.RequestAborted);
+                    break;
+                }
+
+                case "loaded":
+                {
+                    if (!RequireRoom(peer, room, out var current))
+                        break;
+
+                    var epoch = message["epoch"]?.GetValue<int?>() ?? -1;
+                    var result = current!.TryMarkLoaded(peer, epoch);
+                    if (!result.Ok)
+                    {
+                        await peer.SendErrorAsync(result.Code, result.Message, json, context.RequestAborted);
+                        break;
+                    }
+
+                    if (result.GoAt > 0)
+                    {
+                        await current.BroadcastAsync(new
+                        {
+                            type = "go",
+                            room = current.Id,
+                            epoch = current.Epoch,
+                            startAt = result.GoAt,
+                            serverTime = RaceRoom.NowMs()
+                        }, json, context.RequestAborted);
+                    }
+
+                    await current.BroadcastRoomAsync(json, context.RequestAborted);
+                    break;
+                }
+
+                case "return":
+                {
+                    if (!RequireRoom(peer, room, out var current))
+                        break;
+
+                    var epoch = message["epoch"]?.GetValue<int?>() ?? -1;
+                    var result = current!.TryReturn(peer, epoch);
+                    if (!result.Ok)
+                    {
+                        await peer.SendErrorAsync(result.Code, result.Message, json, context.RequestAborted);
+                        break;
+                    }
+
                     await current.BroadcastRoomAsync(json, context.RequestAborted);
                     break;
                 }
@@ -271,6 +316,8 @@ sealed class WebPeer
     public int Kart { get; set; }
     public int Character { get; set; }
     public bool Ready { get; set; }
+    public int LoadedEpoch { get; set; } = -1;
+    public int ReturnedEpoch { get; set; } = -1;
     public RaceState? LastState { get; set; }
     public long LastStateAt { get; set; }
 
@@ -323,6 +370,12 @@ readonly record struct StartResult(bool Ok, string Code, string Message, long St
     public static StartResult Fail(string code, string message) => new(false, code, message, 0);
 }
 
+readonly record struct BarrierResult(bool Ok, string Code, string Message, long GoAt)
+{
+    public static BarrierResult Success(long goAt = 0) => new(true, "", "", goAt);
+    public static BarrierResult Fail(string code, string message) => new(false, code, message, 0);
+}
+
 sealed class RaceRoom
 {
     public const int MaxPlayers = 8;
@@ -335,6 +388,7 @@ sealed class RaceRoom
     public int Epoch { get; private set; }
     public long? StartAt { get; private set; }
     public RaceConfig? Config { get; private set; }
+    public string Phase { get; private set; } = "waiting";
 
     public int Count
     {
@@ -345,6 +399,12 @@ sealed class RaceRoom
     {
         lock (_gate)
         {
+            if (Phase != "waiting" && _slots.Any(x => x is not null))
+            {
+                error = "Race is already preparing or running.";
+                return false;
+            }
+
             if (_slots.Any(x => x is not null && x.Nickname.Equals(nickname, StringComparison.OrdinalIgnoreCase)))
             {
                 error = "Nickname is already in the room.";
@@ -363,6 +423,8 @@ sealed class RaceRoom
             peer.Kart = kart;
             peer.Character = character;
             peer.Ready = false;
+            peer.LoadedEpoch = -1;
+            peer.ReturnedEpoch = -1;
             _slots[slot] = peer;
             error = null;
             return true;
@@ -377,6 +439,8 @@ sealed class RaceRoom
                 _slots[peer.Slot] = null;
             peer.Slot = -1;
             peer.Ready = false;
+            peer.LoadedEpoch = -1;
+            peer.ReturnedEpoch = -1;
             peer.LastState = null;
 
             if (_slots.All(x => x is null))
@@ -384,6 +448,7 @@ sealed class RaceRoom
                 StartAt = null;
                 Epoch = 0;
                 Config = null;
+                Phase = "waiting";
             }
         }
     }
@@ -392,6 +457,9 @@ sealed class RaceRoom
     {
         lock (_gate)
         {
+            if (Phase != "waiting")
+                return;
+
             if (peer.Slot >= 0 && peer.Slot < MaxPlayers && ReferenceEquals(_slots[peer.Slot], peer))
                 peer.Ready = ready;
         }
@@ -404,6 +472,9 @@ sealed class RaceRoom
             var host = Array.FindIndex(_slots, x => x is not null);
             if (host < 0 || peer.Slot != host)
                 return StartResult.Fail("not-host", "Only the room host can change room settings.");
+
+            if (Phase != "waiting")
+                return StartResult.Fail("room-busy", "Room settings cannot change while preparing or racing.");
 
             Config = config;
             return StartResult.Success(0);
@@ -418,6 +489,12 @@ sealed class RaceRoom
             if (host < 0 || peer.Slot != host)
                 return StartResult.Fail("not-host", "Only the room host can start.");
 
+            if (Phase != "waiting")
+                return StartResult.Fail("room-busy", "Race is already preparing or running.");
+
+            if (Config is null)
+                return StartResult.Fail("missing-config", "Room configuration must be synchronized before start.");
+
             var players = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
             if (players.Length < 2)
                 return StartResult.Fail("not-enough-players", "Multiplayer requires at least two players.");
@@ -426,13 +503,73 @@ sealed class RaceRoom
                 return StartResult.Fail("not-ready", "All non-host players must be ready.");
 
             Epoch++;
-            StartAt = NowMs() + 3000;
+            Phase = "preparing";
+            StartAt = null;
             foreach (var player in players)
             {
+                player.LoadedEpoch = -1;
+                player.ReturnedEpoch = -1;
                 player.LastState = null;
                 player.LastStateAt = 0;
             }
-            return StartResult.Success(StartAt.Value);
+
+            return StartResult.Success(0);
+        }
+    }
+
+    public BarrierResult TryMarkLoaded(WebPeer peer, int epoch)
+    {
+        lock (_gate)
+        {
+            if (epoch != Epoch)
+                return BarrierResult.Fail("stale-epoch", "Loaded acknowledgement belongs to a stale race epoch.");
+
+            if (Phase != "preparing")
+                return BarrierResult.Fail("not-preparing", "Room is not waiting for race loading.");
+
+            if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
+                return BarrierResult.Fail("not-in-room", "Player is not in this room.");
+
+            peer.LoadedEpoch = epoch;
+
+            var players = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
+            if (players.Any(x => x.LoadedEpoch != epoch))
+                return BarrierResult.Success();
+
+            Phase = "countdown";
+            StartAt = NowMs() + 7000;
+            return BarrierResult.Success(StartAt.Value);
+        }
+    }
+
+    public BarrierResult TryReturn(WebPeer peer, int epoch)
+    {
+        lock (_gate)
+        {
+            if (epoch != Epoch)
+                return BarrierResult.Fail("stale-epoch", "Return acknowledgement belongs to a stale race epoch.");
+
+            if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
+                return BarrierResult.Fail("not-in-room", "Player is not in this room.");
+
+            peer.ReturnedEpoch = epoch;
+
+            var players = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
+            if (players.Any(x => x.ReturnedEpoch != epoch))
+                return BarrierResult.Success();
+
+            Phase = "waiting";
+            StartAt = null;
+            foreach (var player in players)
+            {
+                player.Ready = false;
+                player.LoadedEpoch = -1;
+                player.ReturnedEpoch = -1;
+                player.LastState = null;
+                player.LastStateAt = 0;
+            }
+
+            return BarrierResult.Success();
         }
     }
 
@@ -445,6 +582,12 @@ sealed class RaceRoom
                 return false;
 
             var now = NowMs();
+            if (Phase == "countdown" && StartAt is not null && now >= StartAt.Value)
+                Phase = "racing";
+
+            if (Phase is not ("countdown" or "racing"))
+                return false;
+
             if (peer.LastStateAt != 0 && now - peer.LastStateAt < 8)
                 return false; // hard cap at roughly 125 Hz
             peer.LastState = state;
@@ -463,6 +606,7 @@ sealed class RaceRoom
                 id = Id,
                 maxPlayers = MaxPlayers,
                 epoch = Epoch,
+                phase = Phase,
                 startAt = StartAt,
                 config = Config,
                 players = _slots.Select((peer, slot) => peer is null ? null : new
@@ -473,6 +617,8 @@ sealed class RaceRoom
                     kart = peer.Kart,
                     character = peer.Character,
                     ready = peer.Ready,
+                    loaded = peer.LoadedEpoch == Epoch && Phase != "waiting",
+                    returned = peer.ReturnedEpoch == Epoch && Phase != "waiting",
                     state = peer.LastState
                 }).Where(x => x is not null).ToArray()
             };
