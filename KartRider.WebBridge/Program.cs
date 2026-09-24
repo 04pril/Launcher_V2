@@ -264,6 +264,7 @@ app.Map("/ws", async context =>
                         hitbox = state.Value.Hitbox,
                         mass = state.Value.Mass,
                         pairBalance = state.Value.PairBalance,
+                        motorcyclePresentation = state.Value.MotorcyclePresentation,
                         collisionAck = state.Value.CollisionAck,
                         boosterState = state.Value.BoosterState,
                         dualBoosterMode = state.Value.DualBoosterMode,
@@ -906,6 +907,7 @@ readonly record struct RaceState(
     double[]? Hitbox,
     double Mass,
     double PairBalance,
+    double MotorcyclePresentation,
     long CollisionAck,
     int BoosterState,
     int DualBoosterMode,
@@ -931,6 +933,7 @@ readonly record struct RaceState(
             var time = message["t"]?.GetValue<long?>() ?? 0;
             var mass = message["mass"]?.GetValue<double?>() ?? 100;
             var pairBalance = message["pairBalance"]?.GetValue<double?>() ?? 1;
+            var motorcyclePresentation = message["motorcyclePresentation"]?.GetValue<double?>() ?? 0;
             var collisionAck = message["collisionAck"]?.GetValue<long?>() ?? 0;
             var boosterState = message["boosterState"]?.GetValue<int?>() ?? 0;
             var dualBoosterMode = message["dualBoosterMode"]?.GetValue<int?>() ?? 0;
@@ -945,12 +948,13 @@ readonly record struct RaceState(
                 (hitbox is not null && (!Finite(hitbox) || hitbox.Any(x => x <= 0 || x > 10))) ||
                 !double.IsFinite(mass) || mass is < 1 or > 10000 ||
                 !double.IsFinite(pairBalance) || pairBalance is < 0 or > 4 ||
+                !double.IsFinite(motorcyclePresentation) || Math.Abs(motorcyclePresentation) > 100 ||
                 collisionAck < 0 ||
                 boosterState is < 0 or > 64 || dualBoosterMode is < 0 or > 16 ||
                 !double.IsFinite(speed) || !double.IsFinite(routeProgress))
                 return null;
 
-            return new RaceState(seq, time, p, q, v, hitbox, mass, pairBalance, collisionAck, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
+            return new RaceState(seq, time, p, q, v, hitbox, mass, pairBalance, motorcyclePresentation, collisionAck, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
         }
         catch
         {
