@@ -443,12 +443,26 @@ sealed class RaceRoom
             peer.ReturnedEpoch = -1;
             peer.LastState = null;
 
-            if (_slots.All(x => x is null))
+            var remaining = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
+            if (remaining.Length == 0)
             {
                 StartAt = null;
                 Epoch = 0;
                 Config = null;
                 Phase = "waiting";
+            }
+            else if (remaining.Length < 2 && Phase != "waiting")
+            {
+                StartAt = null;
+                Phase = "waiting";
+                foreach (var player in remaining)
+                {
+                    player.Ready = false;
+                    player.LoadedEpoch = -1;
+                    player.ReturnedEpoch = -1;
+                    player.LastState = null;
+                    player.LastStateAt = 0;
+                }
             }
         }
     }
