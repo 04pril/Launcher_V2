@@ -386,6 +386,7 @@ sealed class RaceRoom
 
     public string Id { get; }
     public int Epoch { get; private set; }
+    public long Revision { get; private set; }
     public long? StartAt { get; private set; }
     public RaceConfig? Config { get; private set; }
     public string Phase { get; private set; } = "waiting";
@@ -426,6 +427,7 @@ sealed class RaceRoom
             peer.LoadedEpoch = -1;
             peer.ReturnedEpoch = -1;
             _slots[slot] = peer;
+            Revision++;
             error = null;
             return true;
         }
@@ -442,6 +444,7 @@ sealed class RaceRoom
             peer.LoadedEpoch = -1;
             peer.ReturnedEpoch = -1;
             peer.LastState = null;
+            Revision++;
 
             var remaining = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
             if (remaining.Length == 0)
@@ -474,8 +477,11 @@ sealed class RaceRoom
             if (Phase != "waiting")
                 return;
 
-            if (peer.Slot >= 0 && peer.Slot < MaxPlayers && ReferenceEquals(_slots[peer.Slot], peer))
+            if (peer.Slot >= 0 && peer.Slot < MaxPlayers && ReferenceEquals(_slots[peer.Slot], peer) && peer.Ready != ready)
+            {
                 peer.Ready = ready;
+                Revision++;
+            }
         }
     }
 
@@ -491,6 +497,7 @@ sealed class RaceRoom
                 return StartResult.Fail("room-busy", "Room settings cannot change while preparing or racing.");
 
             Config = config;
+            Revision++;
             return StartResult.Success(0);
         }
     }
@@ -517,6 +524,7 @@ sealed class RaceRoom
                 return StartResult.Fail("not-ready", "All non-host players must be ready.");
 
             Epoch++;
+            Revision++;
             Phase = "preparing";
             StartAt = null;
             foreach (var player in players)
@@ -544,13 +552,18 @@ sealed class RaceRoom
             if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
                 return BarrierResult.Fail("not-in-room", "Player is not in this room.");
 
-            peer.LoadedEpoch = epoch;
+            if (peer.LoadedEpoch != epoch)
+            {
+                peer.LoadedEpoch = epoch;
+                Revision++;
+            }
 
             var players = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
             if (players.Any(x => x.LoadedEpoch != epoch))
                 return BarrierResult.Success();
 
             Phase = "countdown";
+            Revision++;
             StartAt = NowMs() + 7000;
             return BarrierResult.Success(StartAt.Value);
         }
@@ -566,13 +579,18 @@ sealed class RaceRoom
             if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
                 return BarrierResult.Fail("not-in-room", "Player is not in this room.");
 
-            peer.ReturnedEpoch = epoch;
+            if (peer.ReturnedEpoch != epoch)
+            {
+                peer.ReturnedEpoch = epoch;
+                Revision++;
+            }
 
             var players = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
             if (players.Any(x => x.ReturnedEpoch != epoch))
                 return BarrierResult.Success();
 
             Phase = "waiting";
+            Revision++;
             StartAt = null;
             foreach (var player in players)
             {
@@ -620,6 +638,7 @@ sealed class RaceRoom
                 id = Id,
                 maxPlayers = MaxPlayers,
                 epoch = Epoch,
+                revision = Revision,
                 phase = Phase,
                 startAt = StartAt,
                 config = Config,
