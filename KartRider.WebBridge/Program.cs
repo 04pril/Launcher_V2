@@ -261,6 +261,7 @@ app.Map("/ws", async context =>
                         p = state.Value.Position,
                         q = state.Value.Rotation,
                         v = state.Value.Velocity,
+                        hitbox = state.Value.Hitbox,
                         speed = state.Value.Speed,
                         lap = state.Value.Lap,
                         checkpoint = state.Value.Checkpoint,
@@ -780,6 +781,7 @@ readonly record struct RaceState(
     double[] Position,
     double[] Rotation,
     double[] Velocity,
+    double[]? Hitbox,
     double Speed,
     int Lap,
     int Checkpoint,
@@ -794,7 +796,8 @@ readonly record struct RaceState(
             var p = ReadVector(message["p"], 3);
             var q = ReadVector(message["q"], 4);
             var v = ReadVector(message["v"], 3);
-            if (p is null || q is null || v is null)
+            var hitbox = message["hitbox"] is null ? null : ReadVector(message["hitbox"], 3);
+            if (p is null || q is null || v is null || (message["hitbox"] is not null && hitbox is null))
                 return null;
 
             var seq = message["seq"]?.GetValue<long?>() ?? 0;
@@ -806,10 +809,10 @@ readonly record struct RaceState(
             var drifting = message["drifting"]?.GetValue<bool?>() ?? false;
             var boost = message["boost"]?.GetValue<bool?>() ?? false;
 
-            if (!Finite(p) || !Finite(q) || !Finite(v) || !double.IsFinite(speed) || !double.IsFinite(routeProgress))
+            if (!Finite(p) || !Finite(q) || !Finite(v) || (hitbox is not null && (!Finite(hitbox) || hitbox.Any(x => x <= 0 || x > 10))) || !double.IsFinite(speed) || !double.IsFinite(routeProgress))
                 return null;
 
-            return new RaceState(seq, time, p, q, v, speed, lap, checkpoint, routeProgress, drifting, boost);
+            return new RaceState(seq, time, p, q, v, hitbox, speed, lap, checkpoint, routeProgress, drifting, boost);
         }
         catch
         {
