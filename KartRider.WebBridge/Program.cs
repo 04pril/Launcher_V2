@@ -262,6 +262,8 @@ app.Map("/ws", async context =>
                         q = state.Value.Rotation,
                         v = state.Value.Velocity,
                         hitbox = state.Value.Hitbox,
+                        mass = state.Value.Mass,
+                        pairBalance = state.Value.PairBalance,
                         boosterState = state.Value.BoosterState,
                         dualBoosterMode = state.Value.DualBoosterMode,
                         speed = state.Value.Speed,
@@ -279,10 +281,10 @@ app.Map("/ws", async context =>
                     if (!RequireRoom(peer, room, out var current))
                         break;
 
-                    var collision = CollisionImpulse.TryParse(message);
+                    var collision = PairCollisionCorrection.TryParse(message);
                     if (collision is null)
                     {
-                        await peer.SendErrorAsync("bad-collision", "Collision impulse is invalid.", json, context.RequestAborted);
+                        await peer.SendErrorAsync("bad-collision", "Pair collision correction is invalid.", json, context.RequestAborted);
                         break;
                     }
 
@@ -290,8 +292,6 @@ app.Map("/ws", async context =>
                         break;
 
                     var collisionTime = RaceRoom.NowMs();
-                    var sourceImpulse = collision.Value.Impulse;
-                    var targetImpulse = new[] { -sourceImpulse[0], -sourceImpulse[1] };
                     await Task.WhenAll(
                         peer.SendAsync(new
                         {
@@ -300,7 +300,7 @@ app.Map("/ws", async context =>
                             epoch = current.Epoch,
                             sourceSlot = peer.Slot,
                             otherSlot = collision.Value.TargetSlot,
-                            impulse = sourceImpulse,
+                            impulse = collision.Value.SourceDelta,
                             serverTime = collisionTime
                         }, json, context.RequestAborted),
                         target!.SendAsync(new
@@ -310,7 +310,7 @@ app.Map("/ws", async context =>
                             epoch = current.Epoch,
                             sourceSlot = peer.Slot,
                             otherSlot = peer.Slot,
-                            impulse = targetImpulse,
+                            impulse = collision.Value.TargetDelta,
                             serverTime = collisionTime
                         }, json, context.RequestAborted)
                     );
@@ -742,6 +742,8 @@ sealed class RaceRoom
                 return false;
             if (targetSlot < 0 || targetSlot >= MaxPlayers || targetSlot == source.Slot)
                 return false;
+            if (source.Slot >= targetSlot)
+                return false;
 
             var now = NowMs();
             if (source.LastCollisionAt != 0 && now - source.LastCollisionAt < 25)
@@ -849,9 +851,9 @@ readonly record struct RaceConfig(
     }
 }
 
-readonly record struct CollisionImpulse(int TargetSlot, double[] Impulse)
+readonly record struct PairCollisionCorrection(int TargetSlot, double[] SourceDelta, double[] TargetDelta)
 {
-    public static CollisionImpulse? TryParse(JsonObject message)
+    public static PairCollisionCorrection? TryParse(JsonObject message)
     {
         try
         {
@@ -859,21 +861,32 @@ readonly record struct CollisionImpulse(int TargetSlot, double[] Impulse)
             if (targetSlot is < 0 or >= RaceRoom.MaxPlayers)
                 return null;
 
-            if (message["impulse"] is not JsonArray array || array.Count != 2)
+            var sourceDelta = ReadDelta(message["sourceDelta"]);
+            var targetDelta = ReadDelta(message["targetDelta"]);
+            if (sourceDelta is null || targetDelta is null)
                 return null;
 
-            var x = array[0]?.GetValue<double?>() ?? double.NaN;
-            var z = array[1]?.GetValue<double?>() ?? double.NaN;
-            var magnitude = Math.Sqrt(x * x + z * z);
-            if (!double.IsFinite(x) || !double.IsFinite(z) || !double.IsFinite(magnitude) || magnitude <= 0 || magnitude > 20)
+            var sourceMagnitude = Math.Sqrt(sourceDelta[0] * sourceDelta[0] + sourceDelta[1] * sourceDelta[1]);
+            var targetMagnitude = Math.Sqrt(targetDelta[0] * targetDelta[0] + targetDelta[1] * targetDelta[1]);
+            if (sourceMagnitude > 20 || targetMagnitude > 20 || (sourceMagnitude <= 0 && targetMagnitude <= 0))
                 return null;
 
-            return new CollisionImpulse(targetSlot, new[] { x, z });
+            return new PairCollisionCorrection(targetSlot, sourceDelta, targetDelta);
         }
         catch
         {
             return null;
         }
+    }
+
+    private static double[]? ReadDelta(JsonNode? node)
+    {
+        if (node is not JsonArray array || array.Count != 2)
+            return null;
+
+        var x = array[0]?.GetValue<double?>() ?? double.NaN;
+        var z = array[1]?.GetValue<double?>() ?? double.NaN;
+        return double.IsFinite(x) && double.IsFinite(z) ? new[] { x, z } : null;
     }
 }
 
@@ -884,6 +897,8 @@ readonly record struct RaceState(
     double[] Rotation,
     double[] Velocity,
     double[]? Hitbox,
+    double Mass,
+    double PairBalance,
     int BoosterState,
     int DualBoosterMode,
     double Speed,
@@ -906,6 +921,8 @@ readonly record struct RaceState(
 
             var seq = message["seq"]?.GetValue<long?>() ?? 0;
             var time = message["t"]?.GetValue<long?>() ?? 0;
+            var mass = message["mass"]?.GetValue<double?>() ?? 100;
+            var pairBalance = message["pairBalance"]?.GetValue<double?>() ?? 1;
             var boosterState = message["boosterState"]?.GetValue<int?>() ?? 0;
             var dualBoosterMode = message["dualBoosterMode"]?.GetValue<int?>() ?? 0;
             var speed = message["speed"]?.GetValue<double?>() ?? 0;
@@ -917,11 +934,13 @@ readonly record struct RaceState(
 
             if (!Finite(p) || !Finite(q) || !Finite(v) ||
                 (hitbox is not null && (!Finite(hitbox) || hitbox.Any(x => x <= 0 || x > 10))) ||
+                !double.IsFinite(mass) || mass is < 1 or > 10000 ||
+                !double.IsFinite(pairBalance) || pairBalance is < 0 or > 4 ||
                 boosterState is < 0 or > 64 || dualBoosterMode is < 0 or > 16 ||
                 !double.IsFinite(speed) || !double.IsFinite(routeProgress))
                 return null;
 
-            return new RaceState(seq, time, p, q, v, hitbox, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
+            return new RaceState(seq, time, p, q, v, hitbox, mass, pairBalance, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
         }
         catch
         {
