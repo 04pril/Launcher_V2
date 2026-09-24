@@ -117,6 +117,30 @@ app.Map("/ws", async context =>
                     break;
                 }
 
+                case "loadout":
+                {
+                    if (!RequireRoom(peer, room, out var current))
+                        break;
+
+                    var kart = message["kart"]?.GetValue<int?>() ?? 0;
+                    var character = message["character"]?.GetValue<int?>() ?? 0;
+                    if (kart < 0 || character < 0)
+                    {
+                        await peer.SendErrorAsync("bad-loadout", "Loadout item IDs must be non-negative.", json, context.RequestAborted);
+                        break;
+                    }
+
+                    var result = current!.TryUpdateLoadout(peer, kart, character);
+                    if (!result.Ok)
+                    {
+                        await peer.SendErrorAsync(result.Code, result.Message, json, context.RequestAborted);
+                        break;
+                    }
+
+                    await current.BroadcastRoomAsync(json, context.RequestAborted);
+                    break;
+                }
+
                 case "config":
                 {
                     if (!RequireRoom(peer, room, out var current))
@@ -485,6 +509,27 @@ sealed class RaceRoom
                 peer.Ready = ready;
                 Revision++;
             }
+        }
+    }
+
+    public StartResult TryUpdateLoadout(WebPeer peer, int kart, int character)
+    {
+        lock (_gate)
+        {
+            if (Phase != "waiting")
+                return StartResult.Fail("room-busy", "Loadout cannot change while preparing or racing.");
+
+            if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
+                return StartResult.Fail("not-in-room", "Player is not in this room.");
+
+            if (peer.Kart == kart && peer.Character == character)
+                return StartResult.Success(0);
+
+            peer.Kart = kart;
+            peer.Character = character;
+            peer.Ready = false;
+            Revision++;
+            return StartResult.Success(0);
         }
     }
 
