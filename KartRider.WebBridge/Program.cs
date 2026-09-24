@@ -289,15 +289,31 @@ app.Map("/ws", async context =>
                     if (!current!.TryGetCollisionTarget(peer, collision.Value.TargetSlot, out var target))
                         break;
 
-                    await target!.SendAsync(new
-                    {
-                        type = "collision",
-                        room = current.Id,
-                        epoch = current.Epoch,
-                        sourceSlot = peer.Slot,
-                        impulse = collision.Value.Impulse,
-                        serverTime = RaceRoom.NowMs()
-                    }, json, context.RequestAborted);
+                    var collisionTime = RaceRoom.NowMs();
+                    var sourceImpulse = collision.Value.Impulse;
+                    var targetImpulse = new[] { -sourceImpulse[0], -sourceImpulse[1] };
+                    await Task.WhenAll(
+                        peer.SendAsync(new
+                        {
+                            type = "collision",
+                            room = current.Id,
+                            epoch = current.Epoch,
+                            sourceSlot = peer.Slot,
+                            otherSlot = collision.Value.TargetSlot,
+                            impulse = sourceImpulse,
+                            serverTime = collisionTime
+                        }, json, context.RequestAborted),
+                        target!.SendAsync(new
+                        {
+                            type = "collision",
+                            room = current.Id,
+                            epoch = current.Epoch,
+                            sourceSlot = peer.Slot,
+                            otherSlot = peer.Slot,
+                            impulse = targetImpulse,
+                            serverTime = collisionTime
+                        }, json, context.RequestAborted)
+                    );
                     break;
                 }
 
