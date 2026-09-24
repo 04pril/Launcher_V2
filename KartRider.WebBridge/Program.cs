@@ -261,6 +261,7 @@ app.Map("/ws", async context =>
                         p = state.Value.Position,
                         q = state.Value.Rotation,
                         v = state.Value.Velocity,
+                        yawRate = state.Value.YawRate,
                         hitbox = state.Value.Hitbox,
                         mass = state.Value.Mass,
                         pairBalance = state.Value.PairBalance,
@@ -904,6 +905,7 @@ readonly record struct RaceState(
     double[] Position,
     double[] Rotation,
     double[] Velocity,
+    double YawRate,
     double[]? Hitbox,
     double Mass,
     double PairBalance,
@@ -925,6 +927,7 @@ readonly record struct RaceState(
             var p = ReadVector(message["p"], 3);
             var q = ReadVector(message["q"], 4);
             var v = ReadVector(message["v"], 3);
+            var yawRate = message["yawRate"]?.GetValue<double?>() ?? 0;
             var hitbox = message["hitbox"] is null ? null : ReadVector(message["hitbox"], 3);
             if (p is null || q is null || v is null || (message["hitbox"] is not null && hitbox is null))
                 return null;
@@ -945,6 +948,7 @@ readonly record struct RaceState(
             var boost = message["boost"]?.GetValue<bool?>() ?? false;
 
             if (!Finite(p) || !Finite(q) || !Finite(v) ||
+                !double.IsFinite(yawRate) || Math.Abs(yawRate) > 100 ||
                 (hitbox is not null && (!Finite(hitbox) || hitbox.Any(x => x <= 0 || x > 10))) ||
                 !double.IsFinite(mass) || mass is < 1 or > 10000 ||
                 !double.IsFinite(pairBalance) || pairBalance is < 0 or > 4 ||
@@ -954,7 +958,7 @@ readonly record struct RaceState(
                 !double.IsFinite(speed) || !double.IsFinite(routeProgress))
                 return null;
 
-            return new RaceState(seq, time, p, q, v, hitbox, mass, pairBalance, motorcyclePresentation, collisionAck, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
+            return new RaceState(seq, time, p, q, v, yawRate, hitbox, mass, pairBalance, motorcyclePresentation, collisionAck, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
         }
         catch
         {
