@@ -264,6 +264,7 @@ app.Map("/ws", async context =>
                         hitbox = state.Value.Hitbox,
                         mass = state.Value.Mass,
                         pairBalance = state.Value.PairBalance,
+                        collisionAck = state.Value.CollisionAck,
                         boosterState = state.Value.BoosterState,
                         dualBoosterMode = state.Value.DualBoosterMode,
                         speed = state.Value.Speed,
@@ -292,6 +293,7 @@ app.Map("/ws", async context =>
                         break;
 
                     var collisionTime = RaceRoom.NowMs();
+                    var collisionId = current.NextCollisionSerial();
                     await Task.WhenAll(
                         peer.SendAsync(new
                         {
@@ -300,6 +302,7 @@ app.Map("/ws", async context =>
                             epoch = current.Epoch,
                             sourceSlot = peer.Slot,
                             otherSlot = collision.Value.TargetSlot,
+                            collisionId,
                             impulse = collision.Value.SourceDelta,
                             serverTime = collisionTime
                         }, json, context.RequestAborted),
@@ -310,6 +313,7 @@ app.Map("/ws", async context =>
                             epoch = current.Epoch,
                             sourceSlot = peer.Slot,
                             otherSlot = peer.Slot,
+                            collisionId,
                             impulse = collision.Value.TargetDelta,
                             serverTime = collisionTime
                         }, json, context.RequestAborted)
@@ -452,6 +456,7 @@ readonly record struct BarrierResult(bool Ok, string Code, string Message, long 
 
 sealed class RaceRoom
 {
+    private long _collisionSerial;
     public const int MaxPlayers = 8;
     private readonly object _gate = new();
     private readonly WebPeer?[] _slots = new WebPeer?[MaxPlayers];
@@ -758,6 +763,8 @@ sealed class RaceRoom
         }
     }
 
+    public long NextCollisionSerial() => Interlocked.Increment(ref _collisionSerial);
+
     public object Snapshot()
     {
         lock (_gate)
@@ -899,6 +906,7 @@ readonly record struct RaceState(
     double[]? Hitbox,
     double Mass,
     double PairBalance,
+    long CollisionAck,
     int BoosterState,
     int DualBoosterMode,
     double Speed,
@@ -923,6 +931,7 @@ readonly record struct RaceState(
             var time = message["t"]?.GetValue<long?>() ?? 0;
             var mass = message["mass"]?.GetValue<double?>() ?? 100;
             var pairBalance = message["pairBalance"]?.GetValue<double?>() ?? 1;
+            var collisionAck = message["collisionAck"]?.GetValue<long?>() ?? 0;
             var boosterState = message["boosterState"]?.GetValue<int?>() ?? 0;
             var dualBoosterMode = message["dualBoosterMode"]?.GetValue<int?>() ?? 0;
             var speed = message["speed"]?.GetValue<double?>() ?? 0;
@@ -936,11 +945,12 @@ readonly record struct RaceState(
                 (hitbox is not null && (!Finite(hitbox) || hitbox.Any(x => x <= 0 || x > 10))) ||
                 !double.IsFinite(mass) || mass is < 1 or > 10000 ||
                 !double.IsFinite(pairBalance) || pairBalance is < 0 or > 4 ||
+                collisionAck < 0 ||
                 boosterState is < 0 or > 64 || dualBoosterMode is < 0 or > 16 ||
                 !double.IsFinite(speed) || !double.IsFinite(routeProgress))
                 return null;
 
-            return new RaceState(seq, time, p, q, v, hitbox, mass, pairBalance, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
+            return new RaceState(seq, time, p, q, v, hitbox, mass, pairBalance, collisionAck, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
         }
         catch
         {
