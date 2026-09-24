@@ -219,8 +219,11 @@ app.Map("/ws", async context =>
                         break;
                     }
 
-                    if (!current!.TryUpdateState(peer, state.Value, out var slot))
+                    if (!current!.TryUpdateState(peer, state.Value, out var slot, out var phaseChanged))
                         break;
+
+                    if (phaseChanged)
+                        await current.BroadcastRoomAsync(json, context.RequestAborted);
 
                     await current.BroadcastExceptAsync(peer, new
                     {
@@ -605,17 +608,22 @@ sealed class RaceRoom
         }
     }
 
-    public bool TryUpdateState(WebPeer peer, RaceState state, out int slot)
+    public bool TryUpdateState(WebPeer peer, RaceState state, out int slot, out bool phaseChanged)
     {
         lock (_gate)
         {
+            phaseChanged = false;
             slot = peer.Slot;
             if (slot < 0 || slot >= MaxPlayers || !ReferenceEquals(_slots[slot], peer))
                 return false;
 
             var now = NowMs();
             if (Phase == "countdown" && StartAt is not null && now >= StartAt.Value)
+            {
                 Phase = "racing";
+                Revision++;
+                phaseChanged = true;
+            }
 
             if (Phase is not ("countdown" or "racing"))
                 return false;
