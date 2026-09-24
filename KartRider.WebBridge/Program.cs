@@ -262,12 +262,41 @@ app.Map("/ws", async context =>
                         q = state.Value.Rotation,
                         v = state.Value.Velocity,
                         hitbox = state.Value.Hitbox,
+                        boosterState = state.Value.BoosterState,
+                        dualBoosterMode = state.Value.DualBoosterMode,
                         speed = state.Value.Speed,
                         lap = state.Value.Lap,
                         checkpoint = state.Value.Checkpoint,
                         routeProgress = state.Value.RouteProgress,
                         drifting = state.Value.Drifting,
                         boost = state.Value.Boost
+                    }, json, context.RequestAborted);
+                    break;
+                }
+
+                case "collision":
+                {
+                    if (!RequireRoom(peer, room, out var current))
+                        break;
+
+                    var collision = CollisionImpulse.TryParse(message);
+                    if (collision is null)
+                    {
+                        await peer.SendErrorAsync("bad-collision", "Collision impulse is invalid.", json, context.RequestAborted);
+                        break;
+                    }
+
+                    if (!current!.TryGetCollisionTarget(peer, collision.Value.TargetSlot, out var target))
+                        break;
+
+                    await target!.SendAsync(new
+                    {
+                        type = "collision",
+                        room = current.Id,
+                        epoch = current.Epoch,
+                        sourceSlot = peer.Slot,
+                        impulse = collision.Value.Impulse,
+                        serverTime = RaceRoom.NowMs()
                     }, json, context.RequestAborted);
                     break;
                 }
@@ -348,6 +377,7 @@ sealed class WebPeer
     public int ReturnedEpoch { get; set; } = -1;
     public RaceState? LastState { get; set; }
     public long LastStateAt { get; set; }
+    public long LastCollisionAt { get; set; }
 
     public async Task<string?> ReceiveTextAsync(CancellationToken cancellationToken)
     {
@@ -493,6 +523,7 @@ sealed class RaceRoom
                     player.ReturnedEpoch = -1;
                     player.LastState = null;
                     player.LastStateAt = 0;
+                player.LastCollisionAt = 0;
                 }
             }
         }
@@ -582,6 +613,7 @@ sealed class RaceRoom
                 player.ReturnedEpoch = -1;
                 player.LastState = null;
                 player.LastStateAt = 0;
+                player.LastCollisionAt = 0;
             }
 
             return StartResult.Success(0);
@@ -648,6 +680,7 @@ sealed class RaceRoom
                 player.ReturnedEpoch = -1;
                 player.LastState = null;
                 player.LastStateAt = 0;
+                player.LastCollisionAt = 0;
             }
 
             return BarrierResult.Success();
@@ -678,6 +711,31 @@ sealed class RaceRoom
                 return false; // hard cap at roughly 125 Hz
             peer.LastState = state;
             peer.LastStateAt = now;
+            return true;
+        }
+    }
+
+    public bool TryGetCollisionTarget(WebPeer source, int targetSlot, out WebPeer? target)
+    {
+        lock (_gate)
+        {
+            target = null;
+            if (Phase != "racing")
+                return false;
+            if (source.Slot < 0 || source.Slot >= MaxPlayers || !ReferenceEquals(_slots[source.Slot], source))
+                return false;
+            if (targetSlot < 0 || targetSlot >= MaxPlayers || targetSlot == source.Slot)
+                return false;
+
+            var now = NowMs();
+            if (source.LastCollisionAt != 0 && now - source.LastCollisionAt < 25)
+                return false;
+
+            target = _slots[targetSlot];
+            if (target is null)
+                return false;
+
+            source.LastCollisionAt = now;
             return true;
         }
     }
@@ -775,6 +833,34 @@ readonly record struct RaceConfig(
     }
 }
 
+readonly record struct CollisionImpulse(int TargetSlot, double[] Impulse)
+{
+    public static CollisionImpulse? TryParse(JsonObject message)
+    {
+        try
+        {
+            var targetSlot = message["targetSlot"]?.GetValue<int?>() ?? -1;
+            if (targetSlot is < 0 or >= RaceRoom.MaxPlayers)
+                return null;
+
+            if (message["impulse"] is not JsonArray array || array.Count != 2)
+                return null;
+
+            var x = array[0]?.GetValue<double?>() ?? double.NaN;
+            var z = array[1]?.GetValue<double?>() ?? double.NaN;
+            var magnitude = Math.Sqrt(x * x + z * z);
+            if (!double.IsFinite(x) || !double.IsFinite(z) || !double.IsFinite(magnitude) || magnitude <= 0 || magnitude > 20)
+                return null;
+
+            return new CollisionImpulse(targetSlot, new[] { x, z });
+        }
+        catch
+        {
+            return null;
+        }
+    }
+}
+
 readonly record struct RaceState(
     long Seq,
     long Time,
@@ -782,6 +868,8 @@ readonly record struct RaceState(
     double[] Rotation,
     double[] Velocity,
     double[]? Hitbox,
+    int BoosterState,
+    int DualBoosterMode,
     double Speed,
     int Lap,
     int Checkpoint,
@@ -802,6 +890,8 @@ readonly record struct RaceState(
 
             var seq = message["seq"]?.GetValue<long?>() ?? 0;
             var time = message["t"]?.GetValue<long?>() ?? 0;
+            var boosterState = message["boosterState"]?.GetValue<int?>() ?? 0;
+            var dualBoosterMode = message["dualBoosterMode"]?.GetValue<int?>() ?? 0;
             var speed = message["speed"]?.GetValue<double?>() ?? 0;
             var lap = message["lap"]?.GetValue<int?>() ?? 0;
             var checkpoint = message["checkpoint"]?.GetValue<int?>() ?? 0;
@@ -809,10 +899,13 @@ readonly record struct RaceState(
             var drifting = message["drifting"]?.GetValue<bool?>() ?? false;
             var boost = message["boost"]?.GetValue<bool?>() ?? false;
 
-            if (!Finite(p) || !Finite(q) || !Finite(v) || (hitbox is not null && (!Finite(hitbox) || hitbox.Any(x => x <= 0 || x > 10))) || !double.IsFinite(speed) || !double.IsFinite(routeProgress))
+            if (!Finite(p) || !Finite(q) || !Finite(v) ||
+                (hitbox is not null && (!Finite(hitbox) || hitbox.Any(x => x <= 0 || x > 10))) ||
+                boosterState is < 0 or > 64 || dualBoosterMode is < 0 or > 16 ||
+                !double.IsFinite(speed) || !double.IsFinite(routeProgress))
                 return null;
 
-            return new RaceState(seq, time, p, q, v, hitbox, speed, lap, checkpoint, routeProgress, drifting, boost);
+            return new RaceState(seq, time, p, q, v, hitbox, boosterState, dualBoosterMode, speed, lap, checkpoint, routeProgress, drifting, boost);
         }
         catch
         {
