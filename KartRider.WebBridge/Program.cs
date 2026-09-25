@@ -261,37 +261,29 @@ app.Map("/ws", async context =>
                         break;
 
                     var epoch = message["epoch"]?.GetValue<int?>() ?? -1;
-                    var amount = message["amount"]?.GetValue<double?>() ?? double.NaN;
-                    var result = current!.TryAddTeamGauge(peer, epoch, amount);
+                    var value = message["value"]?.GetValue<double?>() ?? double.NaN;
+                    var result = current!.TryAddTeamGauge(peer, epoch, value);
                     if (!result.Ok)
                     {
                         await peer.SendErrorAsync(result.Code, result.Message, json, context.RequestAborted);
                         break;
                     }
 
-                    await current.BroadcastAsync(new
+                    // Mirrors GameTeamBoosterSetGaugePacket semantics:
+                    // one team byte + one authoritative normalized gauge float,
+                    // delivered only to members of that team. A value of exactly
+                    // 1.0 is the conversion/full signal; the room-side accumulator
+                    // is already reset for the next cycle.
+                    await current.BroadcastTeamAsync(result.Team, new
                     {
                         type = "team-gauge",
                         room = current.Id,
                         epoch = current.Epoch,
-                        gauges = result.Gauges,
+                        team = result.Team + 1,
+                        gauge = result.Gauge,
+                        full = result.Full,
                         serverTime = RaceRoom.NowMs()
                     }, json, context.RequestAborted);
-
-                    if (result.Triggered)
-                    {
-                        await current.BroadcastAsync(new
-                        {
-                            type = "team-boost",
-                            room = current.Id,
-                            epoch = current.Epoch,
-                            team = result.Team,
-                            serial = result.Serial,
-                            conversionMs = 1000,
-                            gauges = result.Gauges,
-                            serverTime = RaceRoom.NowMs()
-                        }, json, context.RequestAborted);
-                    }
                     break;
                 }
 
@@ -850,7 +842,7 @@ sealed class RaceRoom
         }
     }
 
-    public TeamGaugeResult TryAddTeamGauge(WebPeer peer, int epoch, double amount)
+    public TeamGaugeResult TryAddTeamGauge(WebPeer peer, int epoch, double value)
     {
         lock (_gate)
         {
@@ -866,22 +858,29 @@ sealed class RaceRoom
             if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
                 return TeamGaugeResult.Fail("not-in-room", "Player is not in this room.");
 
-            if (!double.IsFinite(amount) || amount <= 0 || amount > 2.0)
+            // Original request packet carries a float contribution. Known
+            // Launcher_V2/P236 server implementations apply:
+            //   gauge += value * 0.000125 / sameTeamPlayerCount
+            // and clamp to 1.0 before broadcasting SetGaugePacket.
+            if (!double.IsFinite(value) || value <= 0 || value > 8000.0)
                 return TeamGaugeResult.Fail("bad-team-gauge", "Team gauge contribution is invalid.");
 
             var team = peer.Team & 1;
-            var target = TeamGaugeTargetNoLock(team);
-            _teamGaugeUnits[team] += amount;
+            var teamCount = _slots.Count(x => x is not null && (x.Team & 1) == team);
+            if (teamCount <= 0)
+                return TeamGaugeResult.Fail("empty-team", "Team has no active players.");
 
-            var triggered = false;
-            if (_teamGaugeUnits[team] >= target)
-            {
-                _teamGaugeUnits[team] %= target;
+            var next = _teamGaugeUnits[team] + value * 0.000125 / teamCount;
+            var full = next >= 1.0;
+            var outgoingGauge = full ? 1.0 : Math.Clamp(next, 0.0, 1.0);
+
+            // Native-style cycle: peers first observe gauge=1.0. The room
+            // accumulator then starts the next cycle from zero.
+            _teamGaugeUnits[team] = full ? 0.0 : outgoingGauge;
+            if (full)
                 _teamBoostSerial[team]++;
-                triggered = true;
-            }
 
-            return TeamGaugeResult.Success(team, triggered, _teamBoostSerial[team], TeamGaugeSnapshotNoLock());
+            return TeamGaugeResult.Success(team, outgoingGauge, full);
         }
     }
 
@@ -936,23 +935,6 @@ sealed class RaceRoom
         8 => 1,
         _ => 0
     };
-
-    private double TeamGaugeTargetNoLock(int team)
-    {
-        var count = _slots.Count(x => x is not null && (x.Team & 1) == (team & 1));
-        return Math.Max(2.0, count * 2.0);
-    }
-
-    private TeamGaugeSnapshot[] TeamGaugeSnapshotNoLock()
-    {
-        return Enumerable.Range(0, 2).Select(team =>
-        {
-            var target = TeamGaugeTargetNoLock(team);
-            var units = _teamGaugeUnits[team];
-            var ratio = target <= 0 ? 0 : Math.Clamp(units / target, 0, 1);
-            return new TeamGaugeSnapshot(team, units, target, ratio, _teamBoostSerial[team]);
-        }).ToArray();
-    }
 
     private void ResetTeamRaceStateNoLock()
     {
@@ -1033,7 +1015,6 @@ sealed class RaceRoom
                 phase = Phase,
                 startAt = StartAt,
                 config = Config,
-                teamGauges = TeamGaugeSnapshotNoLock(),
                 teamScores = (int[])_teamScores.Clone(),
                 players = _slots.Select((peer, slot) => peer is null ? null : new
                 {
@@ -1067,6 +1048,14 @@ sealed class RaceRoom
         return Task.WhenAll(peers.Select(x => SafeSendAsync(x, payload, json, cancellationToken)));
     }
 
+    public Task BroadcastTeamAsync(int team, object payload, JsonSerializerOptions json, CancellationToken cancellationToken)
+    {
+        WebPeer[] peers;
+        lock (_gate)
+            peers = _slots.Where(x => x is not null && (x.Team & 1) == (team & 1)).Cast<WebPeer>().ToArray();
+        return Task.WhenAll(peers.Select(x => SafeSendAsync(x, payload, json, cancellationToken)));
+    }
+
     public Task BroadcastExceptAsync(WebPeer except, object payload, JsonSerializerOptions json, CancellationToken cancellationToken)
     {
         WebPeer[] peers;
@@ -1084,15 +1073,13 @@ sealed class RaceRoom
     public static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
 }
 
-readonly record struct TeamGaugeSnapshot(int Team, double Units, double Target, double Ratio, int Serial);
-
-readonly record struct TeamGaugeResult(bool Ok, string Code, string Message, int Team, bool Triggered, int Serial, TeamGaugeSnapshot[] Gauges)
+readonly record struct TeamGaugeResult(bool Ok, string Code, string Message, int Team, double Gauge, bool Full)
 {
-    public static TeamGaugeResult Success(int team, bool triggered, int serial, TeamGaugeSnapshot[] gauges) =>
-        new(true, "", "", team, triggered, serial, gauges);
+    public static TeamGaugeResult Success(int team, double gauge, bool full) =>
+        new(true, "", "", team, gauge, full);
 
     public static TeamGaugeResult Fail(string code, string message) =>
-        new(false, code, message, -1, false, 0, Array.Empty<TeamGaugeSnapshot>());
+        new(false, code, message, -1, 0.0, false);
 }
 
 readonly record struct FinishResult(bool Ok, string Code, string Message, int Place, int Points, int[] Scores, bool Final)
