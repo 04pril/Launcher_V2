@@ -141,6 +141,29 @@ app.Map("/ws", async context =>
                     break;
                 }
 
+                case "team":
+                {
+                    if (!RequireRoom(peer, room, out var current))
+                        break;
+
+                    var team = message["team"]?.GetValue<int?>() ?? -1;
+                    if (team is < 0 or > 1)
+                    {
+                        await peer.SendErrorAsync("bad-team", "Team must be 0 or 1.", json, context.RequestAborted);
+                        break;
+                    }
+
+                    var result = current!.TrySetTeam(peer, team);
+                    if (!result.Ok)
+                    {
+                        await peer.SendErrorAsync(result.Code, result.Message, json, context.RequestAborted);
+                        break;
+                    }
+
+                    await current.BroadcastRoomAsync(json, context.RequestAborted);
+                    break;
+                }
+
                 case "config":
                 {
                     if (!RequireRoom(peer, room, out var current))
@@ -394,6 +417,7 @@ sealed class WebPeer
     public string Nickname { get; set; } = "";
     public int Kart { get; set; }
     public int Character { get; set; }
+    public int Team { get; set; }
     public bool Ready { get; set; }
     public int LoadedEpoch { get; set; } = -1;
     public int ReturnedEpoch { get; set; } = -1;
@@ -504,6 +528,7 @@ sealed class RaceRoom
             peer.Nickname = nickname;
             peer.Kart = kart;
             peer.Character = character;
+            peer.Team = slot & 1;
             peer.Ready = false;
             peer.LoadedEpoch = -1;
             peer.ReturnedEpoch = -1;
@@ -582,6 +607,29 @@ sealed class RaceRoom
 
             peer.Kart = kart;
             peer.Character = character;
+            peer.Ready = false;
+            Revision++;
+            return StartResult.Success(0);
+        }
+    }
+
+    public StartResult TrySetTeam(WebPeer peer, int team)
+    {
+        lock (_gate)
+        {
+            if (Phase != "waiting")
+                return StartResult.Fail("room-busy", "Team cannot change while preparing or racing.");
+
+            if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
+                return StartResult.Fail("not-in-room", "Player is not in this room.");
+
+            if (team is < 0 or > 1)
+                return StartResult.Fail("bad-team", "Team must be 0 or 1.");
+
+            if (peer.Team == team)
+                return StartResult.Success(0);
+
+            peer.Team = team;
             peer.Ready = false;
             Revision++;
             return StartResult.Success(0);
@@ -788,6 +836,7 @@ sealed class RaceRoom
                     nickname = peer.Nickname,
                     kart = peer.Kart,
                     character = peer.Character,
+                    team = peer.Team,
                     ready = peer.Ready,
                     loaded = peer.LoadedEpoch == Epoch && Phase != "waiting",
                     returned = peer.ReturnedEpoch == Epoch && Phase != "waiting",
