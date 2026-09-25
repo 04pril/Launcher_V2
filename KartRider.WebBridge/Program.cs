@@ -879,7 +879,8 @@ readonly record struct RaceConfig(
     string MapPath,
     int Speed,
     int Booster,
-    string ChannelMode)
+    string MatchMode,
+    string SpeedMode)
 {
     public static RaceConfig? TryParse(JsonObject message)
     {
@@ -889,7 +890,15 @@ readonly record struct RaceConfig(
             var mapPath = message["mapPath"]?.GetValue<string>()?.Trim() ?? "";
             var speed = message["speed"]?.GetValue<int?>() ?? 7;
             var booster = message["booster"]?.GetValue<int?>() ?? 0;
-            var channelMode = message["channelMode"]?.GetValue<string>()?.Trim().ToLowerInvariant() ?? "solo";
+
+            // New protocol keeps team/individual choice independent from
+            // combined/infinite-booster speed mode. channelMode is accepted only
+            // as a compatibility fallback for older browser bundles.
+            var legacyChannelMode = message["channelMode"]?.GetValue<string>()?.Trim().ToLowerInvariant() ?? "";
+            var matchMode = message["matchMode"]?.GetValue<string>()?.Trim().ToLowerInvariant()
+                ?? (legacyChannelMode == "team" ? "team" : "solo");
+            var speedMode = message["speedMode"]?.GetValue<string>()?.Trim().ToLowerInvariant()
+                ?? (legacyChannelMode == "infinite" ? "infinite" : "combined");
 
             if (trackId.Length is < 1 or > 64 ||
                 mapPath.Length is < 1 or > 192 ||
@@ -898,10 +907,11 @@ readonly record struct RaceConfig(
                 trackId.Any(char.IsControl) ||
                 speed is < 0 or > 16 ||
                 booster is < 0 or > 16 ||
-                channelMode is not ("solo" or "team" or "combined" or "infinite"))
+                matchMode is not ("solo" or "team") ||
+                speedMode is not ("combined" or "infinite"))
                 return null;
 
-            return new RaceConfig(trackId, mapPath, speed, booster, channelMode);
+            return new RaceConfig(trackId, mapPath, speed, booster, matchMode, speedMode);
         }
         catch
         {
