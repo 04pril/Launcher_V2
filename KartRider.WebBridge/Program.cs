@@ -668,8 +668,6 @@ sealed class RaceRoom
                 return StartResult.Fail("missing-config", "Room configuration must be synchronized before start.");
 
             var players = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
-            if (players.Length < 2)
-                return StartResult.Fail("not-enough-players", "Multiplayer requires at least two players.");
 
             if (players.Any(x => x.Slot != host && !x.Ready))
                 return StartResult.Fail("not-ready", "All non-host players must be ready.");
@@ -880,7 +878,8 @@ readonly record struct RaceConfig(
     string TrackId,
     string MapPath,
     int Speed,
-    int Booster)
+    int Booster,
+    string ChannelMode)
 {
     public static RaceConfig? TryParse(JsonObject message)
     {
@@ -890,6 +889,7 @@ readonly record struct RaceConfig(
             var mapPath = message["mapPath"]?.GetValue<string>()?.Trim() ?? "";
             var speed = message["speed"]?.GetValue<int?>() ?? 7;
             var booster = message["booster"]?.GetValue<int?>() ?? 0;
+            var channelMode = message["channelMode"]?.GetValue<string>()?.Trim().ToLowerInvariant() ?? "solo";
 
             if (trackId.Length is < 1 or > 64 ||
                 mapPath.Length is < 1 or > 192 ||
@@ -897,10 +897,11 @@ readonly record struct RaceConfig(
                 mapPath.Any(char.IsControl) ||
                 trackId.Any(char.IsControl) ||
                 speed is < 0 or > 16 ||
-                booster is < 0 or > 16)
+                booster is < 0 or > 16 ||
+                channelMode is not ("solo" or "team" or "combined" or "infinite"))
                 return null;
 
-            return new RaceConfig(trackId, mapPath, speed, booster);
+            return new RaceConfig(trackId, mapPath, speed, booster, channelMode);
         }
         catch
         {
