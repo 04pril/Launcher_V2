@@ -255,6 +255,77 @@ app.Map("/ws", async context =>
                     break;
                 }
 
+                case "team-gauge":
+                {
+                    if (!RequireRoom(peer, room, out var current))
+                        break;
+
+                    var epoch = message["epoch"]?.GetValue<int?>() ?? -1;
+                    var amount = message["amount"]?.GetValue<double?>() ?? double.NaN;
+                    var result = current!.TryAddTeamGauge(peer, epoch, amount);
+                    if (!result.Ok)
+                    {
+                        await peer.SendErrorAsync(result.Code, result.Message, json, context.RequestAborted);
+                        break;
+                    }
+
+                    await current.BroadcastAsync(new
+                    {
+                        type = "team-gauge",
+                        room = current.Id,
+                        epoch = current.Epoch,
+                        gauges = result.Gauges,
+                        serverTime = RaceRoom.NowMs()
+                    }, json, context.RequestAborted);
+
+                    if (result.Triggered)
+                    {
+                        await current.BroadcastAsync(new
+                        {
+                            type = "team-boost",
+                            room = current.Id,
+                            epoch = current.Epoch,
+                            team = result.Team,
+                            serial = result.Serial,
+                            conversionMs = 1000,
+                            gauges = result.Gauges,
+                            serverTime = RaceRoom.NowMs()
+                        }, json, context.RequestAborted);
+                    }
+                    break;
+                }
+
+                case "finish":
+                {
+                    if (!RequireRoom(peer, room, out var current))
+                        break;
+
+                    var epoch = message["epoch"]?.GetValue<int?>() ?? -1;
+                    var elapsedMs = message["elapsedMs"]?.GetValue<long?>() ?? -1;
+                    var result = current!.TryFinish(peer, epoch, elapsedMs);
+                    if (!result.Ok)
+                    {
+                        await peer.SendErrorAsync(result.Code, result.Message, json, context.RequestAborted);
+                        break;
+                    }
+
+                    await current.BroadcastAsync(new
+                    {
+                        type = "team-result",
+                        room = current.Id,
+                        epoch = current.Epoch,
+                        slot = peer.Slot,
+                        team = peer.Team,
+                        place = result.Place,
+                        points = result.Points,
+                        scores = result.Scores,
+                        final = result.Final,
+                        serverTime = RaceRoom.NowMs()
+                    }, json, context.RequestAborted);
+                    await current.BroadcastRoomAsync(json, context.RequestAborted);
+                    break;
+                }
+
                 case "state":
                 {
                     if (!RequireRoom(peer, room, out var current))
@@ -424,6 +495,9 @@ sealed class WebPeer
     public RaceState? LastState { get; set; }
     public long LastStateAt { get; set; }
     public long LastCollisionAt { get; set; }
+    public int FinishedEpoch { get; set; } = -1;
+    public int FinishPlace { get; set; }
+    public int FinishPoints { get; set; }
 
     public async Task<string?> ReceiveTextAsync(CancellationToken cancellationToken)
     {
@@ -486,6 +560,10 @@ sealed class RaceRoom
     public const int MaxPlayers = 8;
     private readonly object _gate = new();
     private readonly WebPeer?[] _slots = new WebPeer?[MaxPlayers];
+    private readonly double[] _teamGaugeUnits = new double[2];
+    private readonly int[] _teamBoostSerial = new int[2];
+    private readonly int[] _teamScores = new int[2];
+    private int _finishSerial;
 
     public RaceRoom(string id) => Id = id;
 
@@ -532,6 +610,9 @@ sealed class RaceRoom
             peer.Ready = false;
             peer.LoadedEpoch = -1;
             peer.ReturnedEpoch = -1;
+            peer.FinishedEpoch = -1;
+            peer.FinishPlace = 0;
+            peer.FinishPoints = 0;
             _slots[slot] = peer;
             Revision++;
             error = null;
@@ -550,6 +631,9 @@ sealed class RaceRoom
             peer.LoadedEpoch = -1;
             peer.ReturnedEpoch = -1;
             peer.LastState = null;
+            peer.FinishedEpoch = -1;
+            peer.FinishPlace = 0;
+            peer.FinishPoints = 0;
             Revision++;
 
             var remaining = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
@@ -559,6 +643,7 @@ sealed class RaceRoom
                 Epoch = 0;
                 Config = null;
                 Phase = "waiting";
+                ResetTeamRaceStateNoLock();
             }
             else if (remaining.Length < 2 && Phase != "waiting")
             {
@@ -648,6 +733,7 @@ sealed class RaceRoom
                 return StartResult.Fail("room-busy", "Room settings cannot change while preparing or racing.");
 
             Config = config;
+            ResetTeamRaceStateNoLock();
             Revision++;
             return StartResult.Success(0);
         }
@@ -676,6 +762,7 @@ sealed class RaceRoom
             Revision++;
             Phase = "preparing";
             StartAt = null;
+            ResetTeamRaceStateNoLock();
             foreach (var player in players)
             {
                 player.LoadedEpoch = -1;
@@ -683,6 +770,9 @@ sealed class RaceRoom
                 player.LastState = null;
                 player.LastStateAt = 0;
                 player.LastCollisionAt = 0;
+                player.FinishedEpoch = -1;
+                player.FinishPlace = 0;
+                player.FinishPoints = 0;
             }
 
             return StartResult.Success(0);
@@ -750,10 +840,126 @@ sealed class RaceRoom
                 player.LastState = null;
                 player.LastStateAt = 0;
                 player.LastCollisionAt = 0;
+                player.FinishedEpoch = -1;
+                player.FinishPlace = 0;
+                player.FinishPoints = 0;
             }
+            ResetTeamRaceStateNoLock();
 
             return BarrierResult.Success();
         }
+    }
+
+    public TeamGaugeResult TryAddTeamGauge(WebPeer peer, int epoch, double amount)
+    {
+        lock (_gate)
+        {
+            if (epoch != Epoch)
+                return TeamGaugeResult.Fail("stale-epoch", "Team gauge update belongs to a stale race epoch.");
+
+            if (Config is null || Config.Value.MatchMode != "team")
+                return TeamGaugeResult.Fail("not-team-mode", "Team gauge is only available in team speed mode.");
+
+            if (Phase != "racing")
+                return TeamGaugeResult.Fail("not-racing", "Team gauge only charges while racing.");
+
+            if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
+                return TeamGaugeResult.Fail("not-in-room", "Player is not in this room.");
+
+            if (!double.IsFinite(amount) || amount <= 0 || amount > 2.0)
+                return TeamGaugeResult.Fail("bad-team-gauge", "Team gauge contribution is invalid.");
+
+            var team = peer.Team & 1;
+            var target = TeamGaugeTargetNoLock(team);
+            _teamGaugeUnits[team] += amount;
+
+            var triggered = false;
+            if (_teamGaugeUnits[team] >= target)
+            {
+                _teamGaugeUnits[team] %= target;
+                _teamBoostSerial[team]++;
+                triggered = true;
+            }
+
+            return TeamGaugeResult.Success(team, triggered, _teamBoostSerial[team], TeamGaugeSnapshotNoLock());
+        }
+    }
+
+    public FinishResult TryFinish(WebPeer peer, int epoch, long elapsedMs)
+    {
+        lock (_gate)
+        {
+            if (epoch != Epoch)
+                return FinishResult.Fail("stale-epoch", "Finish belongs to a stale race epoch.");
+
+            if (Phase is not ("countdown" or "racing"))
+                return FinishResult.Fail("not-racing", "Room is not racing.");
+
+            if (peer.Slot < 0 || peer.Slot >= MaxPlayers || !ReferenceEquals(_slots[peer.Slot], peer))
+                return FinishResult.Fail("not-in-room", "Player is not in this room.");
+
+            if (elapsedMs < 0 || elapsedMs > 24L * 60 * 60 * 1000)
+                return FinishResult.Fail("bad-finish", "Finish time is invalid.");
+
+            if (peer.FinishedEpoch == epoch)
+                return FinishResult.Success(peer.FinishPlace, peer.FinishPoints, (int[])_teamScores.Clone(), AllFinishedNoLock(epoch));
+
+            var place = ++_finishSerial;
+            var points = FinishPointsForPlace(place);
+            peer.FinishedEpoch = epoch;
+            peer.FinishPlace = place;
+            peer.FinishPoints = points;
+
+            if (Config?.MatchMode == "team")
+                _teamScores[peer.Team & 1] += points;
+
+            Revision++;
+            return FinishResult.Success(place, points, (int[])_teamScores.Clone(), AllFinishedNoLock(epoch));
+        }
+    }
+
+    private bool AllFinishedNoLock(int epoch)
+    {
+        var players = _slots.Where(x => x is not null).Cast<WebPeer>().ToArray();
+        return players.Length > 0 && players.All(x => x.FinishedEpoch == epoch);
+    }
+
+    private static int FinishPointsForPlace(int place) => place switch
+    {
+        1 => 10,
+        2 => 8,
+        3 => 6,
+        4 => 5,
+        5 => 4,
+        6 => 3,
+        7 => 2,
+        8 => 1,
+        _ => 0
+    };
+
+    private double TeamGaugeTargetNoLock(int team)
+    {
+        var count = _slots.Count(x => x is not null && (x.Team & 1) == (team & 1));
+        return Math.Max(2.0, count * 2.0);
+    }
+
+    private TeamGaugeSnapshot[] TeamGaugeSnapshotNoLock()
+    {
+        return Enumerable.Range(0, 2).Select(team =>
+        {
+            var target = TeamGaugeTargetNoLock(team);
+            var units = _teamGaugeUnits[team];
+            var ratio = target <= 0 ? 0 : Math.Clamp(units / target, 0, 1);
+            return new TeamGaugeSnapshot(team, units, target, ratio, _teamBoostSerial[team]);
+        }).ToArray();
+    }
+
+    private void ResetTeamRaceStateNoLock()
+    {
+        Array.Clear(_teamGaugeUnits);
+        Array.Clear(_teamBoostSerial);
+        Array.Clear(_teamScores);
+        _finishSerial = 0;
     }
 
     public bool TryUpdateState(WebPeer peer, RaceState state, out int slot, out bool phaseChanged)
@@ -827,6 +1033,8 @@ sealed class RaceRoom
                 phase = Phase,
                 startAt = StartAt,
                 config = Config,
+                teamGauges = TeamGaugeSnapshotNoLock(),
+                teamScores = (int[])_teamScores.Clone(),
                 players = _slots.Select((peer, slot) => peer is null ? null : new
                 {
                     slot,
@@ -838,6 +1046,8 @@ sealed class RaceRoom
                     ready = peer.Ready,
                     loaded = peer.LoadedEpoch == Epoch && Phase != "waiting",
                     returned = peer.ReturnedEpoch == Epoch && Phase != "waiting",
+                    finishPlace = peer.FinishedEpoch == Epoch ? peer.FinishPlace : 0,
+                    finishPoints = peer.FinishedEpoch == Epoch ? peer.FinishPoints : 0,
                     state = peer.LastState
                 }).Where(x => x is not null).ToArray()
             };
@@ -872,6 +1082,26 @@ sealed class RaceRoom
     }
 
     public static long NowMs() => DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+}
+
+readonly record struct TeamGaugeSnapshot(int Team, double Units, double Target, double Ratio, int Serial);
+
+readonly record struct TeamGaugeResult(bool Ok, string Code, string Message, int Team, bool Triggered, int Serial, TeamGaugeSnapshot[] Gauges)
+{
+    public static TeamGaugeResult Success(int team, bool triggered, int serial, TeamGaugeSnapshot[] gauges) =>
+        new(true, "", "", team, triggered, serial, gauges);
+
+    public static TeamGaugeResult Fail(string code, string message) =>
+        new(false, code, message, -1, false, 0, Array.Empty<TeamGaugeSnapshot>());
+}
+
+readonly record struct FinishResult(bool Ok, string Code, string Message, int Place, int Points, int[] Scores, bool Final)
+{
+    public static FinishResult Success(int place, int points, int[] scores, bool final) =>
+        new(true, "", "", place, points, scores, final);
+
+    public static FinishResult Fail(string code, string message) =>
+        new(false, code, message, 0, 0, Array.Empty<int>(), false);
 }
 
 readonly record struct RaceConfig(
